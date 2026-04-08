@@ -257,3 +257,118 @@ class TestConfigIntegration:
         ef = build_embedding_function(cfg, palace)
         assert isinstance(ef, TurboQuantEmbeddingFunction)
         assert ef.bits == 4
+
+    def test_turboquant_rerank_defaults_true(self, tmp_dir):
+        cfg_dir = os.path.join(tmp_dir, "cfg")
+        os.makedirs(cfg_dir)
+        with open(os.path.join(cfg_dir, "config.json"), "w") as f:
+            json.dump({}, f)
+        cfg = MempalaceConfig(config_dir=cfg_dir)
+        assert cfg.turboquant_rerank is True
+
+    def test_turboquant_rerank_factor_default(self, tmp_dir):
+        cfg_dir = os.path.join(tmp_dir, "cfg")
+        os.makedirs(cfg_dir)
+        with open(os.path.join(cfg_dir, "config.json"), "w") as f:
+            json.dump({}, f)
+        cfg = MempalaceConfig(config_dir=cfg_dir)
+        assert cfg.turboquant_rerank_factor == 2
+
+
+# ── Rerank tests ─────────────────────────────────────────────────────────────
+
+
+class TestRerank:
+    """Tests for the over-fetch + exact-cosine rerank step in searcher.py."""
+
+    def test_rerank_returns_n_results(self):
+        """Output length must equal n_results, never the over-fetched count."""
+        from mempalace.searcher import _rerank
+
+        n, dim, n_results = 20, 64, 5
+        docs = [f"doc_{i}" for i in range(n)]
+        metas = [{"wing": "w", "room": "r"} for _ in range(n)]
+        dists = list(np.linspace(0.1, 0.9, n))
+
+        class MockBase:
+            def __call__(self, texts):
+                rng = np.random.default_rng(abs(hash(texts[0])) % 2**31)
+                return [list(rng.standard_normal(dim).astype(np.float32)) for _ in texts]
+
+        out_docs, out_metas, out_dists = _rerank("query text", docs, metas, dists, n_results)
+        assert len(out_docs) == n_results
+        assert len(out_metas) == n_results
+        assert len(out_dists) == n_results
+
+    def test_rerank_improves_or_matches_recall(self, tmp_path):
+        """Recall@5 with rerank should be >= recall@5 without rerank."""
+        import unittest.mock as mock
+        from mempalace.searcher import _rerank
+
+        n, dim, k = 50, 128, 5
+        rng = np.random.default_rng(0)
+
+        # Build a corpus of unit vectors
+        corpus_np = rng.standard_normal((n, dim)).astype(np.float32)
+        corpus_np /= np.linalg.norm(corpus_np, axis=1, keepdims=True)
+
+        ef = TurboQuantEmbeddingFunction(bits=4, params_path=str(tmp_path / "p.json"))
+        tq_corpus = ef.compress_vectors(corpus_np)
+
+        n_queries = 10
+        queries_np = corpus_np[:n_queries]
+        tq_queries = ef.compress_vectors(queries_np)
+        doc_texts = [f"doc_{i}" for i in range(n)]
+        metas_list = [{"wing": "w", "room": "r"} for _ in range(n)]
+
+        recalls_no_rr, recalls_rr = [], []
+
+        for i in range(n_queries):
+            q_raw = queries_np[i : i + 1]
+            q_tq = tq_queries[i : i + 1]
+
+            sims_base = cosine_sim(np.tile(q_raw, (n, 1)), corpus_np)
+            sims_tq = cosine_sim(np.tile(q_tq, (n, 1)), tq_corpus)
+            top_base = set(np.argsort(sims_base)[::-1][:k])
+
+            # Recall without rerank
+            top_tq = set(np.argsort(sims_tq)[::-1][:k])
+            recalls_no_rr.append(len(top_base & top_tq) / k)
+
+            # Over-fetch 2k candidates
+            candidate_ids = np.argsort(sims_tq)[::-1][: k * 2]
+            candidate_docs = [doc_texts[j] for j in candidate_ids]
+            candidate_metas = [metas_list[j] for j in candidate_ids]
+            candidate_dists = [float(1 - sims_tq[j]) for j in candidate_ids]
+
+            # Mock DefaultEmbeddingFunction: query → q_raw, docs → their raw vectors
+            def make_mock_ef(q_vec, c_ids, c_vecs):
+                call_count = [0]
+
+                def _call(texts):
+                    call_count[0] += 1
+                    if call_count[0] == 1:  # first call: query
+                        return [list(q_vec.flatten())]
+                    # second call: candidate docs
+                    idx_map = {doc_texts[j]: j for j in c_ids}
+                    return [list(c_vecs[idx_map[t]]) for t in texts]
+
+                return _call
+
+            mock_ef = make_mock_ef(q_raw, candidate_ids, corpus_np)
+            with mock.patch(
+                "chromadb.utils.embedding_functions.DefaultEmbeddingFunction",
+                return_value=mock_ef,
+            ):
+                out_docs, _, _ = _rerank(
+                    "any_query_text", candidate_docs, candidate_metas, candidate_dists, k
+                )
+
+            top_rr = {int(d.split("_")[1]) for d in out_docs}
+            recalls_rr.append(len(top_base & top_rr) / k)
+
+        mean_no_rr = float(np.mean(recalls_no_rr))
+        mean_rr = float(np.mean(recalls_rr))
+        assert mean_rr >= mean_no_rr, (
+            f"Rerank recall ({mean_rr:.3f}) should be >= no-rerank ({mean_no_rr:.3f})"
+        )

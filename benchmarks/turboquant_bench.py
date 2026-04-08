@@ -29,7 +29,6 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import chromadb
 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
 from mempalace.turboquant_embeddings import TurboQuantEmbeddingFunction
@@ -78,7 +77,7 @@ WORDS = {
     "version": ["v2.3.1", "v1.9.4", "v3.0.0-rc1", "v2.1.0", "v4.2.1"],
     "operation": ["full-text search", "vector query", "aggregation", "export", "batch insert"],
     "time": ["42", "120", "8", "350", "15"],
-    "target": ["100", "200", "50", "500", "30"],
+    "threshold": ["100", "200", "50", "500", "30"],
 }
 
 
@@ -97,6 +96,7 @@ def make_corpus(n: int, seed: int = 42) -> List[str]:
 
 # ── Metrics helpers ───────────────────────────────────────────────────────────
 
+
 def cosine_sim_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Pairwise cosine similarity between rows of a and b."""
     a_n = a / np.maximum(np.linalg.norm(a, axis=1, keepdims=True), 1e-9)
@@ -108,33 +108,55 @@ def top_k_ids(scores: np.ndarray, k: int) -> np.ndarray:
     return np.argsort(scores)[::-1][:k]
 
 
-def recall_at_k(baseline_vecs, tq_vecs, queries_baseline, queries_tq, k: int) -> float:
+def recall_at_k(
+    baseline_vecs,
+    tq_vecs,
+    queries_baseline,
+    queries_tq,
+    k: int,
+    rerank_factor: int = 1,
+    raw_queries_for_rerank=None,
+) -> float:
     """
     Fraction of queries where TurboQuant's top-k overlaps with baseline's top-k.
+
+    When rerank_factor > 1, simulates over-fetch+rerank: TQ fetches factor×k
+    candidates, then reranks with exact cosine (using raw_queries_for_rerank)
+    before returning the final top-k.
     """
     hits = 0
     n_queries = len(queries_baseline)
     n_corpus = len(baseline_vecs)
+    fetch_k = k * rerank_factor
 
     for i in range(n_queries):
         q_base = queries_baseline[i : i + 1]
         q_tq = queries_tq[i : i + 1]
 
-        scores_base = cosine_sim_matrix(
-            np.tile(q_base, (n_corpus, 1)), baseline_vecs
-        )
-        scores_tq = cosine_sim_matrix(
-            np.tile(q_tq, (n_corpus, 1)), tq_vecs
-        )
+        scores_base = cosine_sim_matrix(np.tile(q_base, (n_corpus, 1)), baseline_vecs)
+        scores_tq = cosine_sim_matrix(np.tile(q_tq, (n_corpus, 1)), tq_vecs)
 
         top_base = set(top_k_ids(scores_base, k))
-        top_tq = set(top_k_ids(scores_tq, k))
+        candidate_ids = top_k_ids(scores_tq, fetch_k)
+
+        if rerank_factor > 1 and raw_queries_for_rerank is not None:
+            q_raw = raw_queries_for_rerank[i : i + 1]
+            candidate_vecs = baseline_vecs[candidate_ids]
+            exact_scores = cosine_sim_matrix(
+                np.tile(q_raw, (len(candidate_ids), 1)), candidate_vecs
+            )
+            final_ids = candidate_ids[np.argsort(exact_scores)[::-1][:k]]
+        else:
+            final_ids = candidate_ids[:k]
+
+        top_tq = set(final_ids)
         hits += len(top_base & top_tq) / k
 
     return hits / n_queries
 
 
 # ── Benchmark runner ──────────────────────────────────────────────────────────
+
 
 def run_benchmark(corpus_size: int, n_queries: int, bits_list: List[int], top_k: int):
     print(f"\n{'=' * 65}")
@@ -161,8 +183,10 @@ def run_benchmark(corpus_size: int, n_queries: int, bits_list: List[int], top_k:
 
     dim = raw_embeddings.shape[1]
     print(f"  Embedding dim : {dim}")
-    print(f"  Baseline index time: {baseline_index_time:.2f}s "
-          f"({baseline_index_time / corpus_size * 1000:.1f}ms/doc)")
+    print(
+        f"  Baseline index time: {baseline_index_time:.2f}s "
+        f"({baseline_index_time / corpus_size * 1000:.1f}ms/doc)"
+    )
 
     # Baseline query embeddings
     raw_queries = np.array(base_ef(queries), dtype=np.float32)
@@ -217,7 +241,6 @@ def run_benchmark(corpus_size: int, n_queries: int, bits_list: List[int], top_k:
             # Compression fidelity: cosine sim of compressed vs original
             fidelity_scores = cosine_sim_matrix(raw_embeddings, tq_embeddings)
             mean_fidelity = float(np.mean(fidelity_scores))
-            min_fidelity = float(np.min(fidelity_scores))
 
             # Retrieval quality: top-k agreement rate
             recall = recall_at_k(raw_embeddings, tq_embeddings, raw_queries, tq_queries, top_k)
@@ -227,9 +250,7 @@ def run_benchmark(corpus_size: int, n_queries: int, bits_list: List[int], top_k:
             for i in range(n_queries):
                 q = tq_queries[i : i + 1]
                 t0 = time.perf_counter()
-                scores = cosine_sim_matrix(
-                    np.tile(q, (corpus_size, 1)), tq_embeddings
-                )
+                scores = cosine_sim_matrix(np.tile(q, (corpus_size, 1)), tq_embeddings)
                 _ = top_k_ids(scores, top_k)
                 latencies_tq.append((time.perf_counter() - t0) * 1000)
 
@@ -237,53 +258,109 @@ def run_benchmark(corpus_size: int, n_queries: int, bits_list: List[int], top_k:
             mem_tq_mb = corpus_size * dim * bits / 8 / 1_000_000
             mem_reduction = mem_baseline_mb / mem_tq_mb
 
-        print(f"\n  {'Metric':<35} {'Baseline':>12} {'TQ ' + str(bits) + '-bit':>12} {'Delta':>10}")
-        print(f"  {'-' * 71}")
+            # ── Rerank: over-fetch 2×k, rerank with exact cosine ─────────────
+            rerank_factor = 2
+            fetch_k = top_k * rerank_factor
+            latencies_rerank = []
+            for i in range(n_queries):
+                q_tq = tq_queries[i : i + 1]
+                t0 = time.perf_counter()
+                # Step 1: TQ search over-fetches 2×k candidates
+                scores_tq = cosine_sim_matrix(np.tile(q_tq, (corpus_size, 1)), tq_embeddings)
+                candidate_ids = top_k_ids(scores_tq, fetch_k)
+                # Step 2: exact cosine on raw embeddings for those candidates
+                candidate_docs = raw_embeddings[candidate_ids]
+                q_raw = raw_queries[i : i + 1]
+                exact_scores = cosine_sim_matrix(
+                    np.tile(q_raw, (len(candidate_ids), 1)), candidate_docs
+                )
+                _ = candidate_ids[np.argsort(exact_scores)[::-1][:top_k]]
+                latencies_rerank.append((time.perf_counter() - t0) * 1000)
 
-        def row(label, base_val, tq_val, fmt=".2f", suffix="", higher_is_better=True):
-            delta = tq_val - base_val
-            sign = "+" if delta >= 0 else ""
-            arrow = "▲" if (delta >= 0) == higher_is_better else "▼"
-            print(f"  {label:<35} {base_val:>11{fmt}}{suffix} "
-                  f"{tq_val:>11{fmt}}{suffix} "
-                  f"{arrow} {sign}{delta:.2f}{suffix}")
+            recall_rerank = recall_at_k(
+                raw_embeddings,
+                tq_embeddings,
+                raw_queries,
+                tq_queries,
+                top_k,
+                rerank_factor=rerank_factor,
+                raw_queries_for_rerank=raw_queries,
+            )
 
-        row("Compression fidelity (cosine)", 1.0, mean_fidelity, higher_is_better=True)
-        print(f"  {'  min fidelity':<35} {'1.000':>12} {min_fidelity:>11.3f}")
-        row(f"Retrieval recall@{top_k}", 1.0, recall, higher_is_better=True)
-        print(f"  {'Index time (s)':<35} {baseline_index_time:>11.2f}  "
-              f"{total_index_time:>10.2f}  "
-              f"▼ +{tq_compress_time:.2f}s overhead")
-        row("Query latency median (ms)", np.median(latencies_base),
-            np.median(latencies_tq), higher_is_better=False)
-        row("Query latency p95 (ms)", np.percentile(latencies_base, 95),
-            np.percentile(latencies_tq, 95), higher_is_better=False)
-        print(f"  {'Vector memory — theoretical (MB)':<35} {mem_baseline_mb:>11.1f}  "
-              f"{mem_tq_mb:>10.1f}  ▲ {mem_reduction:.1f}x smaller")
+        col_tq = f"TQ {bits}-bit"
+        col_rr = f"TQ {bits}-bit+RR"
+        print(f"\n  {'Metric':<35} {'Baseline':>10} {col_tq:>12} {col_rr:>13}")
+        print(f"  {'-' * 72}")
+
+        def row3(label, base_val, tq_val, rr_val, fmt=".2f", higher_is_better=True):
+            arrow_tq = "▲" if (tq_val >= base_val) == higher_is_better else "▼"
+            arrow_rr = "▲" if (rr_val >= base_val) == higher_is_better else "▼"
+            print(
+                f"  {label:<35} {base_val:>9{fmt}}  "
+                f"{tq_val:>9{fmt}} {arrow_tq}  "
+                f"{rr_val:>9{fmt}} {arrow_rr}"
+            )
+
+        row3("Compression fidelity (cosine)", 1.0, mean_fidelity, mean_fidelity)
+        row3(f"Retrieval recall@{top_k}", 1.0, recall, recall_rerank)
+        print(
+            f"  {'Index time (s)':<35} {baseline_index_time:>9.2f}  "
+            f"{total_index_time:>9.2f} ▼  "
+            f"{'(same)':>11}"
+        )
+        row3(
+            "Query latency median (ms)",
+            np.median(latencies_base),
+            np.median(latencies_tq),
+            np.median(latencies_rerank),
+            higher_is_better=False,
+        )
+        row3(
+            "Query latency p95 (ms)",
+            np.percentile(latencies_base, 95),
+            np.percentile(latencies_tq, 95),
+            np.percentile(latencies_rerank, 95),
+            higher_is_better=False,
+        )
+        print(
+            f"  {'Vector memory — theoretical (MB)':<35} {mem_baseline_mb:>9.1f}  "
+            f"{mem_tq_mb:>9.1f} ▲  "
+            f"{'(same)':>11}  {mem_reduction:.1f}x"
+        )
 
     print(f"\n{'=' * 65}\n")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="TurboQuant vs Baseline performance benchmark for MemPalace"
     )
     parser.add_argument(
-        "--corpus-size", type=int, default=200,
+        "--corpus-size",
+        type=int,
+        default=200,
         help="Number of documents to index (default: 200)",
     )
     parser.add_argument(
-        "--n-queries", type=int, default=50,
+        "--n-queries",
+        type=int,
+        default=50,
         help="Number of search queries to benchmark (default: 50)",
     )
     parser.add_argument(
-        "--bits", type=int, action="append", dest="bits_list",
+        "--bits",
+        type=int,
+        action="append",
+        dest="bits_list",
         help="Bits per dimension to test (repeat for multiple; default: 3 4)",
     )
     parser.add_argument(
-        "--top-k", type=int, default=5,
+        "--top-k",
+        type=int,
+        default=5,
         help="Top-k for recall measurement (default: 5)",
     )
     args = parser.parse_args()

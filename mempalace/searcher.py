@@ -20,6 +20,33 @@ class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
 
 
+def _rerank(query: str, docs, metas, dists, n_results: int):
+    """
+    Rerank candidates with exact cosine similarity from uncompressed embeddings.
+
+    Called after a TurboQuant over-fetch to recover precision lost to quantization.
+    Re-embeds the small candidate set (factor×k docs) with the base embedding model
+    (no TQ compression) and returns the top-n_results by exact cosine score.
+    """
+    import numpy as np
+    from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+
+    base_ef = DefaultEmbeddingFunction()
+    raw_query = np.array(base_ef([query]), dtype=np.float32)[0]
+    raw_docs = np.array(base_ef(list(docs)), dtype=np.float32)
+
+    q_norm = raw_query / (np.linalg.norm(raw_query) + 1e-9)
+    d_norm = raw_docs / (np.linalg.norm(raw_docs, axis=1, keepdims=True) + 1e-9)
+    sims = d_norm @ q_norm
+
+    order = np.argsort(sims)[::-1][:n_results]
+    return (
+        [docs[i] for i in order],
+        [metas[i] for i in order],
+        [float(1 - sims[i]) for i in order],
+    )
+
+
 def _get_collection(client, palace_path: str, cfg: MempalaceConfig = None):
     """
     Get the mempalace_drawers collection, optionally with TurboQuant embedding function.
@@ -53,9 +80,13 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     Search the palace. Returns verbatim drawer content.
     Optionally filter by wing (project) or room (aspect).
     """
+    cfg = MempalaceConfig()
+    do_rerank = cfg.use_turboquant and cfg.turboquant_rerank
+    fetch_n = n_results * cfg.turboquant_rerank_factor if do_rerank else n_results
+
     try:
         client = chromadb.PersistentClient(path=palace_path)
-        col = _get_collection(client, palace_path)
+        col = _get_collection(client, palace_path, cfg)
     except Exception:
         print(f"\n  No palace found at {palace_path}")
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
@@ -73,7 +104,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     try:
         kwargs = {
             "query_texts": [query],
-            "n_results": n_results,
+            "n_results": fetch_n,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -88,6 +119,11 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     docs = results["documents"][0]
     metas = results["metadatas"][0]
     dists = results["distances"][0]
+
+    if do_rerank and len(docs) > n_results:
+        docs, metas, dists = _rerank(query, docs, metas, dists, n_results)
+    else:
+        docs, metas, dists = docs[:n_results], metas[:n_results], dists[:n_results]
 
     if not docs:
         print(f'\n  No results found for: "{query}"')
@@ -127,9 +163,13 @@ def search_memories(
     Programmatic search — returns a dict instead of printing.
     Used by the MCP server and other callers that need data.
     """
+    cfg = MempalaceConfig()
+    do_rerank = cfg.use_turboquant and cfg.turboquant_rerank
+    fetch_n = n_results * cfg.turboquant_rerank_factor if do_rerank else n_results
+
     try:
         client = chromadb.PersistentClient(path=palace_path)
-        col = _get_collection(client, palace_path)
+        col = _get_collection(client, palace_path, cfg)
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
         return {
@@ -149,7 +189,7 @@ def search_memories(
     try:
         kwargs = {
             "query_texts": [query],
-            "n_results": n_results,
+            "n_results": fetch_n,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -162,6 +202,11 @@ def search_memories(
     docs = results["documents"][0]
     metas = results["metadatas"][0]
     dists = results["distances"][0]
+
+    if do_rerank and len(docs) > n_results:
+        docs, metas, dists = _rerank(query, docs, metas, dists, n_results)
+    else:
+        docs, metas, dists = docs[:n_results], metas[:n_results], dists[:n_results]
 
     hits = []
     for doc, meta, dist in zip(docs, metas, dists):

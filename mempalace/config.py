@@ -133,6 +133,16 @@ class MempalaceConfig:
         """Bits per dimension for TurboQuant compression (1-4). Default: 4."""
         return int(self._file_config.get("turboquant_bits", 4))
 
+    @property
+    def turboquant_rerank(self) -> bool:
+        """Rerank over-fetched TQ candidates with exact cosine similarity. Default: True."""
+        return bool(self._file_config.get("turboquant_rerank", True))
+
+    @property
+    def turboquant_rerank_factor(self) -> int:
+        """Over-fetch multiplier for reranking (fetch factor×k, rerank to k). Default: 2."""
+        return int(self._file_config.get("turboquant_rerank_factor", 2))
+
     def init(self):
         """Create config directory and write default config.json if it doesn't exist."""
         self._config_dir.mkdir(parents=True, exist_ok=True)
