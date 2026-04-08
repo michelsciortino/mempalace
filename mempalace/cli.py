@@ -347,6 +347,121 @@ def cmd_compress(args):
         print("  (dry run -- nothing stored)")
 
 
+def cmd_compress_vectors(args):
+    """Migrate an existing palace to TurboQuant-compressed embeddings.
+
+    Reads all drawer embeddings from ChromaDB, applies TurboQuant inner-product
+    quantization (rotate + quantize to N bits + dequantize back to float32), and
+    re-inserts them in place.  After this command, run ``mempalace search`` with
+    ``use_turboquant: true`` in config.json for consistent results.
+    """
+    import numpy as np
+    import chromadb
+
+    from .turboquant_embeddings import TurboQuantEmbeddingFunction
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    cfg = MempalaceConfig()
+    bits = args.bits if args.bits else cfg.turboquant_bits
+
+    # Connect and read all drawers
+    try:
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+    except Exception:
+        print(f"\n  No palace found at {palace_path}")
+        print("  Run: mempalace init <dir> then mempalace mine <dir>")
+        sys.exit(1)
+
+    total = col.count()
+    if total == 0:
+        print("\n  Palace is empty — nothing to compress.")
+        return
+
+    params_path = TurboQuantEmbeddingFunction.params_path_for_palace(palace_path)
+
+    # Warn if already compressed
+    if Path(params_path).exists() and not args.force:
+        print(
+            f"\n  TurboQuant params already exist at {params_path}"
+            "\n  This palace may already be compressed."
+            "\n  Re-run with --force to compress again (degrades quality)."
+        )
+        sys.exit(1)
+
+    print(f"\n{'=' * 60}")
+    print("  MemPalace — Compress Vectors (TurboQuant)")
+    print(f"{'=' * 60}")
+    print(f"  Palace:     {palace_path}")
+    print(f"  Drawers:    {total:,}")
+    print(f"  Bits/dim:   {bits}  (~{32 // bits}x memory reduction)")
+    print()
+
+    ef = TurboQuantEmbeddingFunction(bits=bits, params_path=params_path)
+
+    _BATCH = 500
+    compressed_count = 0
+    offset = 0
+
+    while offset < total:
+        batch = col.get(
+            limit=_BATCH,
+            offset=offset,
+            include=["embeddings", "documents", "metadatas"],
+        )
+        batch_ids = batch.get("ids", [])
+        batch_embeddings = batch.get("embeddings")
+        batch_metas = batch.get("metadatas", [])
+
+        if not batch_ids:
+            break
+
+        if batch_embeddings is None:
+            # Embeddings not available — re-embed from documents
+            batch_docs = batch.get("documents", [])
+            raw = ef._base_ef(batch_docs)
+            raw_np = np.array(raw, dtype=np.float32)
+        else:
+            raw_np = np.array(batch_embeddings, dtype=np.float32)
+
+        compressed_np = ef.compress_vectors(raw_np)
+
+        if not args.dry_run:
+            col.upsert(
+                ids=batch_ids,
+                embeddings=compressed_np.tolist(),
+                metadatas=batch_metas,
+            )
+
+        compressed_count += len(batch_ids)
+        offset += len(batch_ids)
+
+        pct = compressed_count / total * 100
+        print(f"  Compressed {compressed_count:,}/{total:,} ({pct:.0f}%)...", end="\r")
+
+    print()
+
+    # Estimate size savings
+    if total > 0:
+        sample = raw_np.shape[1] if "raw_np" in dir() else "unknown"
+        if isinstance(sample, int):
+            orig_mb = total * sample * 4 / 1_000_000
+            comp_mb = total * sample * bits / 8 / 1_000_000
+            print(f"\n  Embedding dim:   {sample}")
+            print(f"  Original size:   ~{orig_mb:.1f} MB (float32)")
+            print(f"  Compressed size: ~{comp_mb:.1f} MB ({bits}-bit)")
+            print(f"  Reduction:       ~{orig_mb / max(comp_mb, 0.001):.1f}x")
+
+    if args.dry_run:
+        print("\n  (dry run — nothing was changed)")
+        print(f"  TurboQuant params would be saved to: {params_path}")
+    else:
+        print(f"\n  Done. Params saved to: {params_path}")
+        print('  Enable in config: set "use_turboquant": true in ~/.mempalace/config.json')
+
+    print(f"\n{'=' * 60}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MemPalace — Give your AI a memory. No API key required.",
@@ -457,6 +572,29 @@ def main():
         help="Rebuild palace vector index from stored data (fixes segfaults after corruption)",
     )
 
+    # compress-vectors
+    p_cv = sub.add_parser(
+        "compress-vectors",
+        help="Migrate palace embeddings to TurboQuant compression (6-8x memory reduction)",
+    )
+    p_cv.add_argument(
+        "--bits",
+        type=int,
+        choices=[1, 2, 3, 4],
+        default=None,
+        help="Bits per dimension (default: from config or 4). Higher = better quality.",
+    )
+    p_cv.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be compressed without modifying the palace",
+    )
+    p_cv.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-compress even if turboquant_params.json already exists",
+    )
+
     # status
     sub.add_parser("status", help="Show what's been filed")
 
@@ -472,6 +610,7 @@ def main():
         "split": cmd_split,
         "search": cmd_search,
         "compress": cmd_compress,
+        "compress-vectors": cmd_compress_vectors,
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,
         "status": cmd_status,
