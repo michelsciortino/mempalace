@@ -11,11 +11,41 @@ from pathlib import Path
 
 import chromadb
 
+from .config import MempalaceConfig
+
 logger = logging.getLogger("mempalace_mcp")
 
 
 class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
+
+
+def _get_collection(client, palace_path: str, cfg: MempalaceConfig = None):
+    """
+    Get the mempalace_drawers collection, optionally with TurboQuant embedding function.
+
+    If use_turboquant is enabled in config, the collection is opened with a
+    TurboQuantEmbeddingFunction so that query texts are compressed with the same
+    rotation as the stored drawer embeddings.
+    """
+    if cfg is None:
+        cfg = MempalaceConfig()
+
+    ef = None
+    if cfg.use_turboquant:
+        try:
+            from .turboquant_embeddings import build_embedding_function
+
+            ef = build_embedding_function(cfg, palace_path)
+        except ImportError:
+            logger.warning(
+                "TurboQuant requested but turboquant package not found; "
+                "falling back to default embeddings."
+            )
+
+    if ef is not None:
+        return client.get_collection("mempalace_drawers", embedding_function=ef)
+    return client.get_collection("mempalace_drawers")
 
 
 def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
@@ -25,7 +55,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     """
     try:
         client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
+        col = _get_collection(client, palace_path)
     except Exception:
         print(f"\n  No palace found at {palace_path}")
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
@@ -99,7 +129,7 @@ def search_memories(
     """
     try:
         client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
+        col = _get_collection(client, palace_path)
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
         return {

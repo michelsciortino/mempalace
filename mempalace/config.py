@@ -123,6 +123,16 @@ class MempalaceConfig:
         """Mapping of hall names to keyword lists."""
         return self._file_config.get("hall_keywords", DEFAULT_HALL_KEYWORDS)
 
+    @property
+    def use_turboquant(self) -> bool:
+        """Whether to apply TurboQuant vector compression for search and storage."""
+        return bool(self._file_config.get("use_turboquant", False))
+
+    @property
+    def turboquant_bits(self) -> int:
+        """Bits per dimension for TurboQuant compression (1-4). Default: 4."""
+        return int(self._file_config.get("turboquant_bits", 4))
+
     def init(self):
         """Create config directory and write default config.json if it doesn't exist."""
         self._config_dir.mkdir(parents=True, exist_ok=True)
